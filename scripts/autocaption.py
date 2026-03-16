@@ -5,7 +5,6 @@ autocaption.py — Add burned-in auto-captions to a local UGC video using Whispe
 Usage:
     python3 autocaption.py input_video.mp4
     python3 autocaption.py input_video.mp4 -o captioned_output.mp4
-    python3 autocaption.py input_video.mp4 --style word   # word-by-word highlight
     python3 autocaption.py input_video.mp4 --font-size 80
 
 Requires:
@@ -23,12 +22,12 @@ from pathlib import Path
 
 
 # ── Caption style defaults (UGC-optimised: big, bold, readable) ──────────────
-DEFAULT_FONT_SIZE = 75         # large and readable on mobile
-DEFAULT_FONT_COLOR = "white"   # &H00FFFFFF in ASS hex
+DEFAULT_FONT_SIZE = 45         # medium size, readable without being too large
+DEFAULT_FONT_COLOR = "white"   # CSS color name
 DEFAULT_OUTLINE_COLOR = "black"
-DEFAULT_OUTLINE = 3
+DEFAULT_OUTLINE = 2
 DEFAULT_SHADOW = 1
-DEFAULT_MARGIN_V = 120         # distance from bottom edge (px)
+DEFAULT_MARGIN_V = 80          # near bottom but not clipped (px)
 DEFAULT_MAX_WORDS = 4          # max words per caption line
 
 
@@ -43,6 +42,10 @@ def check_deps():
         import whisper  # noqa: F401
     except ImportError:
         errors.append("  openai-whisper not found — pip install openai-whisper")
+    try:
+        from PIL import Image  # noqa: F401
+    except ImportError:
+        errors.append("  Pillow not found — pip install Pillow")
     if errors:
         print("Missing dependencies:\n" + "\n".join(errors))
         sys.exit(1)
@@ -96,49 +99,182 @@ def segments_to_srt(segments: list[dict], max_words: int) -> str:
     return "\n".join(lines)
 
 
-def build_ffmpeg_style(font_size: int, font_color: str, outline_color: str,
-                       outline: int, shadow: int, margin_v: int) -> str:
-    """Build the FFmpeg subtitles filter force_style string."""
+def parse_srt(srt_path: Path) -> list[tuple[float, float, str]]:
+    """Parse SRT file into list of (start_sec, end_sec, text) tuples."""
+    def ts_to_sec(ts: str) -> float:
+        h, m, rest = ts.strip().split(":")
+        s, ms = rest.split(",")
+        return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
 
-    def color_to_ass(c: str) -> str:
-        """Convert a CSS-like color name/hex to ASS &HAABBGGRR format."""
-        table = {
-            "white":  "&H00FFFFFF",
-            "black":  "&H00000000",
-            "yellow": "&H0000FFFF",
-            "red":    "&H000000FF",
-            "blue":   "&H00FF0000",
-            "green":  "&H0000FF00",
-        }
-        return table.get(c.lower(), "&H00FFFFFF")
+    entries = []
+    content = srt_path.read_text(encoding="utf-8")
+    for block in content.strip().split("\n\n"):
+        lines = block.strip().splitlines()
+        for i, line in enumerate(lines):
+            if "-->" in line:
+                try:
+                    start_str, end_str = line.split("-->")
+                    start = ts_to_sec(start_str)
+                    end = ts_to_sec(end_str)
+                    text = " ".join(lines[i + 1:]).strip()
+                    if text:
+                        entries.append((start, end, text))
+                except Exception:
+                    pass
+                break
+    return entries
 
-    return (
-        f"FontSize={font_size},"
-        "Bold=1,"
-        f"PrimaryColour={color_to_ass(font_color)},"
-        f"OutlineColour={color_to_ass(outline_color)},"
-        f"Outline={outline},"
-        f"Shadow={shadow},"
-        "Alignment=2,"          # bottom-center
-        f"MarginV={margin_v}"
+
+def get_video_info(video_path: Path) -> dict:
+    """Return width, height, fps_num, fps_den, fps, duration via ffprobe."""
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,r_frame_rate",
+            "-show_entries", "format=duration",
+            "-of", "json",
+            str(video_path),
+        ],
+        capture_output=True, text=True,
+    )
+    data = json.loads(result.stdout)
+    stream = data["streams"][0]
+    fps_num, fps_den = map(int, stream["r_frame_rate"].split("/"))
+    return {
+        "width": int(stream["width"]),
+        "height": int(stream["height"]),
+        "fps_num": fps_num,
+        "fps_den": fps_den,
+        "fps": fps_num / fps_den,
+        "duration": float(data["format"]["duration"]),
+    }
+
+
+def find_font(font_size: int):
+    """Return a PIL ImageFont. Tries bold system fonts, falls back to default."""
+    from PIL import ImageFont
+    candidates = [
+        "/Library/Fonts/Arial Bold.ttf",
+        "/Library/Fonts/Arial.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/HelveticaNeue.ttc",
+        "/System/Library/Fonts/SFNS.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, font_size)
+        except (IOError, OSError):
+            pass
+    return ImageFont.load_default()
+
+
+def make_caption_image(
+    text: str, width: int, height: int,
+    font_size: int, font_color: str, outline_color: str,
+    outline_size: int, margin_v: int,
+):
+    """Return a transparent RGBA PIL Image with the caption text burned in."""
+    from PIL import Image, ImageDraw
+
+    color_map = {
+        "white":  (255, 255, 255, 255),
+        "black":  (0,   0,   0,   255),
+        "yellow": (255, 255, 0,   255),
+        "red":    (255, 0,   0,   255),
+        "blue":   (0,   0,   255, 255),
+        "green":  (0,   255, 0,   255),
+    }
+    fc = color_map.get(font_color.lower(),   (255, 255, 255, 255))
+    oc = color_map.get(outline_color.lower(), (0,   0,   0,   255))
+
+    font = find_font(font_size)
+    img  = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    x = width // 2
+    y = height - margin_v
+
+    # Outline: draw text at each neighbouring offset
+    for ox in range(-outline_size, outline_size + 1):
+        for oy in range(-outline_size, outline_size + 1):
+            if ox != 0 or oy != 0:
+                draw.text((x + ox, y + oy), text, font=font, fill=oc, anchor="ms")
+    # Main text
+    draw.text((x, y), text, font=font, fill=fc, anchor="ms")
+
+    return img
+
+
+def burn_captions(
+    video_path: Path, srt_path: Path, output_path: Path,
+    font_size: int, font_color: str, outline_color: str,
+    outline_size: int, margin_v: int,
+) -> None:
+    """Burn captions via Pillow RGBA overlay piped into FFmpeg's overlay filter."""
+    print("[3/3] Burning captions with Pillow + FFmpeg overlay…")
+
+    info = get_video_info(video_path)
+    width, height    = info["width"], info["height"]
+    fps_num, fps_den = info["fps_num"], info["fps_den"]
+    duration         = info["duration"]
+
+    captions = parse_srt(srt_path)
+
+    # Pre-render each unique caption text once
+    caption_cache: dict[str, bytes] = {}
+    for (_, _, text) in captions:
+        if text not in caption_cache:
+            img = make_caption_image(
+                text, width, height,
+                font_size, font_color, outline_color, outline_size, margin_v,
+            )
+            caption_cache[text] = img.tobytes()
+
+    blank_frame = bytes(width * height * 4)   # fully transparent RGBA
+    fps_str     = f"{fps_num}/{fps_den}"
+    total_frames = int(duration * fps_num / fps_den) + 2
+
+    ffmpeg_proc = subprocess.Popen(
+        [
+            "ffmpeg", "-y",
+            "-i", str(video_path),
+            # Pipe: RGBA caption overlay
+            "-f", "rawvideo", "-pix_fmt", "rgba",
+            "-s", f"{width}x{height}",
+            "-r", fps_str,
+            "-i", "pipe:0",
+            # Composite overlay onto source
+            "-filter_complex", "[0:v][1:v]overlay=format=auto",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart",
+            str(output_path),
+        ],
+        stdin=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
 
+    for frame_num in range(total_frames):
+        timestamp  = frame_num * fps_den / fps_num
+        frame_data = blank_frame
+        for (start, end, text) in captions:
+            if start <= timestamp < end:
+                frame_data = caption_cache[text]
+                break
+        try:
+            ffmpeg_proc.stdin.write(frame_data)
+        except BrokenPipeError:
+            break
 
-def burn_captions(video_path: Path, srt_path: Path, output_path: Path,
-                  style: str) -> None:
-    print("[3/3] Burning captions with FFmpeg…")
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", str(video_path),
-        "-vf", "subtitles={}:force_style={}".format(srt_path, style.replace(",", "\\,")),
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-        "-c:a", "aac", "-b:a", "192k",
-        "-movflags", "+faststart",
-        str(output_path),
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print("FFmpeg error:\n", result.stderr[-2000:])
+    ffmpeg_proc.stdin.close()
+    stderr = ffmpeg_proc.stderr.read()
+    ffmpeg_proc.wait()
+
+    if ffmpeg_proc.returncode != 0:
+        print("FFmpeg error:\n", stderr.decode()[-2000:])
         sys.exit(1)
 
 
@@ -195,18 +331,15 @@ def main():
         srt_out.write_text(srt_content)
         print(f"    SRT saved: {srt_out}")
 
-    # Build style string
-    style = build_ffmpeg_style(
+    # Burn captions
+    burn_captions(
+        video_path, srt_tmp, output_path,
         font_size=args.font_size,
         font_color=args.font_color,
         outline_color=args.outline_color,
-        outline=DEFAULT_OUTLINE,
-        shadow=DEFAULT_SHADOW,
+        outline_size=DEFAULT_OUTLINE,
         margin_v=args.margin_v,
     )
-
-    # Burn captions
-    burn_captions(video_path, srt_tmp, output_path, style)
 
     srt_tmp.unlink(missing_ok=True)
 
