@@ -248,7 +248,7 @@ def burn_captions(
             "-i", "pipe:0",
             # Composite overlay onto source
             "-filter_complex", "[0:v][1:v]overlay=format=auto",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart",
             str(output_path),
